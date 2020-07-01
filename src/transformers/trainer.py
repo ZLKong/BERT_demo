@@ -778,6 +778,7 @@ class Trainer:
                             loss_scalar = (tr_loss - logging_loss) / self.args.logging_steps
                             learning_rate_scalar = scheduler.get_last_lr()[0]
                             logs["learning_rate"] = learning_rate_scalar
+                            
                             if self.args.rew:
                                 logs["mixed_loss"] = loss_scalar
                             else:
