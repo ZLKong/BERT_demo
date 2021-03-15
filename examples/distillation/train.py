@@ -304,7 +304,7 @@ def main():
 
     # SANITY CHECKS #
     assert student.config.vocab_size == teacher.config.vocab_size
-    assert student.config.hidden_size == teacher.config.hidden_size
+    #assert student.config.hidden_size == teacher.config.hidden_size
     assert student.config.max_position_embeddings == teacher.config.max_position_embeddings
     if args.mlm:
         assert token_probs.size(0) == stu_architecture_config.vocab_size

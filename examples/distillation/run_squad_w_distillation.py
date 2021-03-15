@@ -50,6 +50,9 @@ from transformers import (
     XLNetTokenizer,
     get_linear_schedule_with_warmup,
     squad_convert_examples_to_features,
+    MobileBertConfig,
+    MobileBertForQuestionAnswering, 
+    MobileBertTokenizer,
 )
 from transformers.data.metrics.squad_metrics import (
     compute_predictions_log_probs,
@@ -74,8 +77,8 @@ MODEL_CLASSES = {
     "xlm": (XLMConfig, XLMForQuestionAnswering, XLMTokenizer),
     "distilbert": (DistilBertConfig, DistilBertForQuestionAnswering, DistilBertTokenizer),
     "roberta": (RobertaConfig, RobertaForQuestionAnswering, RobertaTokenizer),
+    "mobilebert": (MobileBertConfig, MobileBertForQuestionAnswering, MobileBertTokenizer),
 }
-
 
 def set_seed(args):
     random.seed(args.seed)

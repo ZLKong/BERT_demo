@@ -149,27 +149,87 @@ def weight_pruning(args, weight, prune_threshold):
     """
 
     weight = weight.cpu().detach().numpy()  # convert cpu tensor to numpy
+    if args.sparsity_type == "irregular":
+        weight_temp = np.abs(weight)  # a buffer that holds weights with absolute values
+        percentile = np.percentile(weight_temp, prune_threshold*100)  # get a value for this percentitle
+        under_threshold = weight_temp < percentile
+        above_threshold = weight_temp > percentile
+        above_threshold = above_threshold.astype(
+            np.float32)  # has to convert bool to float32 for numpy-tensor conversion
+        weight[under_threshold] = 0
+        #return above_threshold.to(args.device), torch.from_numpy(weight).to(args.device)
+        return torch.from_numpy(above_threshold).cuda(), torch.from_numpy(weight).cuda()
+    elif (args.sparsity_type == "column"):
+        shape = weight.shape
+        weight2d = weight.reshape(shape[0], -1)
+        shape2d = weight2d.shape
+        column_l2_norm = LA.norm(weight2d, 2, axis=0)
+        percentile = np.percentile(column_l2_norm, prune_threshold*100)
+        under_threshold = column_l2_norm < percentile
+        above_threshold = column_l2_norm > percentile
+        weight2d[:, under_threshold] = 0
+        above_threshold = above_threshold.astype(np.float32)
+        expand_above_threshold = np.zeros(shape2d, dtype=np.float32)
+        for i in range(shape2d[1]):
+            expand_above_threshold[:, i] = above_threshold[i]
+        expand_above_threshold = expand_above_threshold.reshape(shape)
+        weight = weight.reshape(shape)
+        return torch.from_numpy(expand_above_threshold).cuda(), torch.from_numpy(weight).cuda()
+    elif (args.sparsity_type == "channel"):
+        shape = weight.shape
+        print("channel pruning...", weight.shape)
+        weight3d = weight.reshape(shape[0], shape[1], -1)
+        channel_l2_norm = LA.norm(weight3d, 2, axis=(0,2))
+        percentile = np.percentile(channel_l2_norm, prune_threshold*100)
+        under_threshold = channel_l2_norm <= percentile
+        above_threshold = channel_l2_norm > percentile
+        weight3d[:,under_threshold,:] = 0
+        above_threshold = above_threshold.astype(np.float32)
+        expand_above_threshold = np.zeros(weight3d.shape, dtype=np.float32)
+        for i in range(weight3d.shape[1]):
+            expand_above_threshold[:, i, :] = above_threshold[i]
+        weight = weight.reshape(shape)
+        expand_above_threshold = expand_above_threshold.reshape(shape)
+        return torch.from_numpy(expand_above_threshold).cuda(), torch.from_numpy(weight).cuda()
+    elif (args.sparsity_type == "filter"):
+        shape = weight.shape
+        weight2d = weight.reshape(shape[0], -1)
+        shape2d = weight2d.shape
+        row_l2_norm = LA.norm(weight2d, 2, axis=1)
+        percentile = np.percentile(row_l2_norm, prune_threshold*100)
+        under_threshold = row_l2_norm <= percentile
+        above_threshold = row_l2_norm > percentile
+        weight2d[under_threshold, :] = 0
+        # weight2d[weight2d < 1e-40] = 0
+        above_threshold = above_threshold.astype(np.float32)
+        expand_above_threshold = np.zeros(shape2d, dtype=np.float32)
+        for i in range(shape2d[0]):
+            expand_above_threshold[i, :] = above_threshold[i]
+        weight = weight.reshape(shape)
+        expand_above_threshold = expand_above_threshold.reshape(shape)
+        return torch.from_numpy(expand_above_threshold).cuda(), torch.from_numpy(weight).cuda()
 
-    if (args.sparsity_type == "block_filter"): # -libn
+    elif (args.sparsity_type == "block_filter"): # -libn
 
         shape = weight.shape
         conv = weight.reshape(shape[0], -1)
+        shape2d = conv.shape
         # print('weight.shape', conv.shape)
 
         block_row_division = args.block_row_division
         block_row_width = args.block_row_width
+        print('conv.shape[1]',conv.shape[1])
+        print('block_row_width',block_row_width)
+        print('block_row_division',block_row_division)
 
-        if block_row_width != 0:
-            if conv.shape[1]%block_row_width != 0 :
-                print("the layer size is not divisible by block_row_width:",conv.shape[1], block_row_width)
-                # raise SyntaxError("block_size error")
-            block_row_division = int(conv.shape[1]/block_row_width)
-        else:
-            if conv.shape[1]%block_row_division != 0 :
-                print("the layer size is not divisible by block_row_division",conv.shape[1], block_row_division)
-                # raise SyntaxError("block_size error")
-        convfrag = torch.chunk(torch.tensor(conv), block_row_division, dim=1)
-        
+        if conv.shape[1]%block_row_division != 0 :
+            print("the layer size is not divisible by block_row_division",conv.shape[1], block_row_division)
+            # raise SyntaxError("block_size error")
+        block_number = int(conv.shape[1]/block_row_division)
+        print('after block_row_division int',block_number)
+        convfrag = torch.chunk(torch.tensor(conv), block_number, dim=1)
+        print('convfrag',len(convfrag))
+
         mat = None
         for k in range(len(convfrag)):
             if mat is None:
@@ -185,20 +245,31 @@ def weight_pruning(args, weight, prune_threshold):
             
         under_threshold = row_norms < prune_threshold
         above_threshold = row_norms > prune_threshold
-        #print('!!! prune_threshold = ', prune_threshold)
+        print('under_threshold, above_threshold',len(under_threshold),len(above_threshold))
+       # print('!!! prune_threshold = ', prune_threshold)
         # above_threshold = above_threshold.astype(
         #     np.float32)  # has to convert bool to float32 for numpy-tensor conversion
 
         # to construct the under_threshold matrix (under_threshold.shape = weight.shape)
-        under_threshold_matrix = torch.tensor(np.tile(under_threshold.reshape((len(under_threshold),1)), int(conv.shape[1]/block_row_division)))
+        print('before under block_number',block_number)
+        print('int(conv.shape[1]/block_number)',int(conv.shape[1]/block_number))
+        print('under_threshold.reshape((len(under_threshold),1))',under_threshold.reshape((len(under_threshold),1)).shape)
+        under_threshold_matrix = torch.tensor(np.tile(under_threshold.reshape((len(under_threshold),1)), int(conv.shape[1]/block_number)))
+        #print('under_threshold_matrix',under_threshold_matrix)
+        print('under_threshold_matrix.shape',under_threshold_matrix.shape)
+        print('int(under_threshold_matrix.shape[0]/conv.shape[0])',int(under_threshold_matrix.shape[0]/conv.shape[0]))
         convfrag = torch.chunk(under_threshold_matrix, int(under_threshold_matrix.shape[0]/conv.shape[0]), dim=0)
+        print('convfrag.shape after under',len(convfrag))
         mat = None
         for m in range(len(convfrag)):
+            #print('convfrag[m] after under',convfrag[m].shape[0])
             if mat is None:
                 mat = convfrag[m]
             else:
                 mat = torch.cat((mat, convfrag[m]), 1)
         under_threshold_matrix = mat
+        
+        print('under_threshold_matrix',len(under_threshold_matrix))
 
         conv[under_threshold_matrix] = 0
 
@@ -208,7 +279,230 @@ def weight_pruning(args, weight, prune_threshold):
         above_threshold = above_threshold.reshape(weight.shape)
 
         return above_threshold.to(args.device), torch.from_numpy(weight).to(args.device)
-                
+
+
+
+    elif (args.sparsity_type == "block_column"): # -libn
+
+        shape = weight.shape
+        conv = weight.reshape(shape[0], -1)
+        print('weight.shape', conv.shape)
+
+        block_row_division = args.block_row_division
+        block_row_width = args.block_row_width
+        print('block_row_width',block_row_width)
+        print('block_row_division',block_row_division)
+        #if conv.shape[0]==30522:
+        #   block_row_division=30522
+
+
+        block_number = int(conv.shape[0]/block_row_width)
+        block_number_noint = conv.shape[0]/block_row_width
+            #print('block_row_division int',block_row_division)
+
+        print('block_row_width int',block_number)
+        #if block_number==170:
+        diff_conv=0
+        if block_number!=block_number_noint:
+            block_number+=1
+            diff_conv=block_number*block_row_width-conv.shape[0]
+            print('diff_conv', diff_conv)
+            arrayzero=torch.zeros(diff_conv,conv.shape[1])
+            print('arrayzero',arrayzero.shape)
+            conv=torch.cat((torch.tensor(conv),arrayzero),0)
+            print('conv+arrayzero',conv.shape)
+            #conv=conv[:-diff]
+            #print('conv[:-diff]',conv.shape)
+            convfrag = torch.chunk(torch.tensor(conv), block_number, dim=0)
+        #elif block_number==0:
+             #block_number=1
+             #convfrag = torch.chunk(torch.tensor(conv), 1, dim=0)         
+        else:   
+             convfrag = torch.chunk(torch.tensor(conv), block_number, dim=0)
+        print('len(convfrag)',len(convfrag))
+        mat = None
+        for k in range(len(convfrag)):
+            #if conv.shape[0]==512:
+            print('convfrag[k]',convfrag[k].shape)
+            if mat is None:
+                mat = convfrag[k]
+            else:
+                if convfrag[k].shape[0]!=block_row_width:
+                    print('**********convfrag[k]',convfrag[k].shape)
+                    diff=convfrag[k].shape[0]-block_row_width
+                    print('diff', diff)
+                    arrayzero=torch.zeros(diff,convfrag[k].shape[1])
+                    print('arrayzero',arrayzero.shape)
+                    combine=torch.cat((convfrag[k],arrayzero),0)
+                    print('convfrag[k]',combine.shape)
+                    mat = torch.cat((mat, combine), 1)
+
+                #if convfrag[k].shape[0]==2:
+                    #print('**********convfrag[k]',convfrag[k].shape)
+                    #arrayzero=torch.zeros(1,768)
+                    #print('arrayzero',arrayzero.shape)
+                    #combine=torch.cat((convfrag[k],arrayzero),0)
+                    #print('convfrag[k]',combine.shape)
+                    #mat = torch.cat((mat, combine), 1)
+                else:
+                    mat = torch.cat((mat, convfrag[k]), 1)
+        # calculate all the norms of each block (block.shape = [1, conv.shape[1]/block_row_division])
+        row_norms = torch.norm(mat.data, dim=0)
+        print('row_norms',len(row_norms))
+        if args.prune_ratio_config != None:
+            #print('!!! prune_ratio = ', prune_threshold)
+            prune_threshold = np.percentile(row_norms, prune_threshold*100)  # get a value for this percentitle
+            
+        under_threshold = row_norms < prune_threshold
+        above_threshold = row_norms > prune_threshold
+        print('under_threshold, above_threshold',len(under_threshold),len(above_threshold))
+        #print('!!! prune_threshold = ', prune_threshold)
+        # above_threshold = above_threshold.astype(
+        #     np.float32)  # has to convert bool to float32 for numpy-tensor conversion
+
+        # to construct the under_threshold matrix (under_threshold.shape = weight.shape)
+        print('before under block_number',block_number)
+        print('int(conv.shape[0]/block_number)',int(conv.shape[0]/block_number))
+        print('under_threshold.reshape((1,len(under_threshold)))',under_threshold.reshape((1,len(under_threshold))).shape)
+        under_threshold_matrix = torch.tensor(np.tile(under_threshold.reshape((1,len(under_threshold))), (int(conv.shape[0]/block_number),1)))
+        #under_threshold_matrix = torch.tensor(np.tile(int(conv.shape[0]/block_row_width),under_threshold.reshape((len(under_threshold),0))))
+        print('under_threshold_matrix.shape',under_threshold_matrix.shape)
+        print('int(under_threshold_matrix.shape[1]/conv.shape[1])',int(under_threshold_matrix.shape[1]/conv.shape[1]))
+        convfrag = torch.chunk(under_threshold_matrix, int(under_threshold_matrix.shape[1]/conv.shape[1]), dim=1)
+        print('convfrag after under',len(convfrag))
+        mat = None
+        for m in range(len(convfrag)):
+            #print('convfrag[m] after under',convfrag[m].shape)
+            if mat is None:
+                mat = convfrag[m]
+            else:
+                mat = torch.cat((mat, convfrag[m]), 0)
+        #if conv.shape[0]==512:
+        #    print('mat before',len(mat))
+        #    mat=mat[:-1]
+        #    print('mat after',len(mat))
+        if diff_conv!=0:
+            mat=mat[:-diff_conv]
+            conv=conv[:-diff_conv]
+            print('conv[:-diff_conv]',conv.shape)
+        under_threshold_matrix = mat
+        print('under_threshold_matrix',len(under_threshold_matrix))
+
+        conv[under_threshold_matrix] = 0
+
+        above_threshold = ~under_threshold_matrix
+
+        conv = conv.reshape(weight.shape)
+        above_threshold = above_threshold.reshape(weight.shape)
+
+        return above_threshold.to(args.device), torch.from_numpy(weight).to(args.device)
+    elif (args.sparsity_type == "whole_block"): # -libn
+        shape = weight.shape
+        conv = weight.reshape(shape[0],-1)
+
+        # Square blocks:
+        # block_row_width = args.block_row_width
+        # block_col_width = args.block_col_width
+        block_row_width = 48
+        block_col_width = 48  #block_row_division
+        # print("Block size: %d, %d" %(block_row_width,block_col_width))
+
+        if conv.shape[1]%block_col_width != 0:
+            print("the layer size is not divisible by block_col_width:",conv.shape[0], conv.shape[1], block_row_width, block_col_width)
+            #raise SyntaxError("block_size error")
+        block_col_division = int(conv.shape[1]/block_col_width)  #竖着几条，block_filter
+        print('block_col_division',block_col_division)
+
+        # Verification result: Step 1 & 2 & 3 are verified! -libn 08/09/2020
+        # Step 1: column division:       
+        # Divide the weight matrix into several blocks according to column                     
+        convfrag = torch.chunk(torch.tensor(conv), block_col_division, dim=1)
+        print('convfrag after filter',len(convfrag))
+        # Concatenate the derived blocks
+        convfrag = torch.cat(convfrag, 0)
+        print('convfrag.shape',convfrag.shape)
+        # Calculate row l2 norm:
+        block_row_norms = torch.norm(convfrag, dim=1)  
+        print('block_row_norms',len(block_row_norms))   #488352
+        print('block_row_norms.shape',block_row_norms.shape)
+        if len(block_row_norms)%block_row_width != 0:
+            print("the len(block_row_norms) is not divisible by block_row_width:",len(block_row_norms),block_row_width)
+
+
+        # Step 2: row division:
+        # Divide the weight matrix into several blocks according to row   
+        block_row_division = int(len(block_row_norms)/block_row_width)   
+        print('block_row_division',block_row_division) #10174
+        block_row_division_noint =  len(block_row_norms)/block_row_width
+
+        #####
+        #####
+        diff_conv=0
+        if block_row_division!=block_row_division_noint:
+            block_row_division+=1
+            diff_conv=block_row_division*block_row_width-len(block_row_norms)
+            print('diff_conv', diff_conv)
+            arrayzero=torch.zeros(diff_conv,block_col_width)
+            print('arrayzero',arrayzero.shape)
+            convfrag=torch.cat((torch.tensor(convfrag),arrayzero),0)
+            print('new convfrag.shape',convfrag.shape)
+            #block_norms = torch.chunk(torch.tensor(convfrag), block_row_division, dim=0)
+            
+        else:     
+            #block_norms = torch.chunk(torch.tensor(convfrag), block_row_division, dim=0)
+        print('block_norms',len(block_norms))
+        # Concatenate the row l2 norms:
+        chunk_save=block_norms #save list of chunks, before cat together
+        block_norms2 = torch.cat(block_norms, 0)  
+        print('block_norms2',len(block_norms2))
+        block_norms = torch.norm(block_norms2, dim=1)
+        print('block_norms after',len(block_norms))
+
+        if args.prune_ratio_config != None:
+            print('!!! prune_ratio = ', prune_threshold)
+            prune_threshold = np.percentile(block_norms, prune_threshold*100)  # get a value for this percentitle
+        above_threshold = block_norms > prune_threshold
+        print('above_threshold',above_threshold)
+        print('len(above_threshold)',len(above_threshold))
+        print('len(above_threshold:5)',len(above_threshold[:5]))
+        print(1*above_threshold[:5])
+        print(torch.where(above_threshold[:5]))
+        #above_threshold tensor([False, False, False,  ..., False, False, False])
+        #len(above_threshold) 91648
+        #len(above_threshold:5) 5
+        #tensor([0, 0, 0, 0, 0])
+        #(tensor([], dtype=torch.int64),)
+        #above_threshold_chunked_matrix (91648, 256)
+        #kk 0
+        #kk*block_row_width 0
+        #(kk+1)*block_row_width 256
+        #above_threshold[kk] tensor(False)
+        #kk 1
+        #kk*block_row_width 256
+        #(kk+1)*block_row_width 512
+        #above_threshold[kk] tensor(False)
+        #kk 2
+
+        # Step 3: to reproduce weight matrix using above_threshold:
+        #above_threshold_chunked_matrix = np.zeros(torch.cat(torch.chunk(torch.tensor(conv), block_col_division, dim=1),0).shape).astype('int')
+        above_threshold_chunked_matrix = np.zeros(block_norms2.shape).astype('int')
+        print('above_threshold_chunked_matrix',above_threshold_chunked_matrix.shape)
+        for kk in range(len(chunk_save)):    #举例 -- x[1:4,:] 指第一二三行
+            print('kk',kk)
+            print('kk*block_row_width',kk*block_row_width)
+            print('(kk+1)*block_row_width',(kk+1)*block_row_width)
+            print('above_threshold[kk]',above_threshold[kk])
+            above_threshold_chunked_matrix[kk*block_row_width:(kk+1)*block_row_width,:] = block_norms2[kk] * np.ones((block_row_width,block_col_width)).astype('int')
+        above_threshold_tmp = torch.chunk(torch.tensor(above_threshold_chunked_matrix), block_row_division, dim=0)
+        print('above_threshold_tmp',above_threshold_tmp.shape)
+        above_threshold_matrix = torch.cat(above_threshold_tmp, 1).numpy()
+        print('above_threshold_matrix',above_threshold_matrix.shape)
+        
+        conv *= above_threshold_matrix
+        
+        weight = conv.reshape(weight.shape)
+
+        return torch.from_numpy(above_threshold_matrix.reshape(weight.shape)).cuda(), torch.from_numpy(weight).cuda() 
     else:
         raise SyntaxError("Unknown sparsity type")
 
@@ -312,3 +606,4 @@ class GradualWarmupScheduler(_LRScheduler):
             return self.after_scheduler.step(epoch)
         else:
             return super(GradualWarmupScheduler, self).step(epoch)
+

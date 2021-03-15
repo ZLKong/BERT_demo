@@ -67,6 +67,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Function
+from torch.nn.parameter import Parameter
 
 
 class Round(Function):
@@ -93,93 +94,153 @@ class ScaleSign(Function):
 
 class Quantize(Function):
     @staticmethod
-    def forward(ctx, input, bit):
-        scale = float(2 ** bit - 1)
-        return torch.round(input * scale) / scale
+    def forward(ctx, input, bit, scheme='fp'):
+        # I. fix point:
+        if scheme == 'fp':
+            scale = float(2 ** bit - 1)
+            out = torch.round(input * scale) / scale
+
+        # II. power of 2:
+        elif scheme == 'po2':
+            out = 2 ** torch.round(torch.log2(input)) * (input > 2 ** (-2 ** bit + 1)).float()
+
+        # III. sp2:
+        elif scheme == 'sp2':
+            size = input.size()
+            y = input.reshape(-1)
+
+            centroids = torch.tensor(
+                [0, 2 ** -4, 2 ** -3, 2 ** -4 + 2 ** -3, 2 ** -2, 2 ** -2 + 2 ** -3, 2 ** -1, 2 ** -1 + 2 ** -3, 1]).cuda()
+            mag = y - centroids.reshape(-1, 1)
+
+            minimum = torch.min(torch.abs(mag), dim=0)[1]
+            out = centroids[minimum]
+            out = out.reshape(size)
+        else:
+            raise NotImplementedError
+        return out
 
     @staticmethod
     def backward(ctx, grad_output):
-        return grad_output, None
+        return grad_output, None, None
 
 
-class DorefaW(nn.Module):
-    def __init__(self):
-        super(DorefaW, self).__init__()
-
-    def forward(self, w, bit):
-        if bit == 1:
-            w = ScaleSign.apply(w)
-        elif bit == 2:
-            raise NotImplementedError
+def DorefaW(w, bit):
+    mix = False
+    if bit == 1:
+        w = ScaleSign.apply(w)
+    elif bit == 2:
+        pass
+    else:
+        sign = torch.sign(w)
+        scale = torch.max(torch.abs(w))
+        # w = torch.tanh(w)
+        w = torch.abs(w) / scale
+        # w = w / (2 * scale) + 0.5
+        if mix:
+            weight = w.detach()
+            size = weight.size()
+            w2d = weight.reshape(weight.size(0), -1)
+            var = torch.var(w2d, dim=1)
+            ######
+            out, idx = torch.topk(var, ((var.size(0) * 1) // 3))
+            mid = out[-1]
+            # mid = torch.median(var)
+            # mix scheme:
+            greater = w2d * (var >= mid).float().reshape(-1, 1)
+            lower = w2d * (var < mid).float().reshape(-1, 1)
+            greater_quant = Quantize.apply(greater, bit-1, 'fp')
+            lower_quant = Quantize.apply(lower, bit-1, 'sp2')
+            residual = (greater_quant + lower_quant - w2d).reshape(size)
+            # finally, a tricky method
+            w = w + residual
+            # print('quantized?', w)
         else:
-            w = torch.tanh(w)
-            w = w / (2 * torch.max(torch.abs(w))) + 0.5
-            w = 2 * Quantize.apply(w, bit) - 1
-        return w
+            w = Quantize.apply(w, bit - 1, 'fp')
+
+        w = w * scale * sign
+    return w
 
 
-class QActivation(Function):
-
+class AQuantization(Function):
     # Note that both forward and backward are @staticmethods
     @staticmethod
-    def forward(ctx, input, k=4):
-        ctx.save_for_backward(input)
+    def forward(ctx, input, a, scheme='linear', k=4):
+        ctx.save_for_backward(input, a)
         # output = input.sign()
-        input = torch.clamp(input, min=0.0, max=1.0)
-        output = torch.round(input * float(2 ** k - 1)) / float(2 ** k - 1)
+        if scheme == 'linear':
+            output = 0.5 * (torch.abs(input) - torch.abs(input - a) + a)
+            output = torch.round(output * float(2 ** k - 1) / a) * (a / float(2 ** k - 1))
+        else:
+            raise NotImplementedError
         return output
 
     # This function has only a single output, so it gets only one gradient
     @staticmethod
     def backward(ctx, grad_output):
-        input, = ctx.saved_tensors
+        input, a = ctx.saved_tensors
+
         if ctx.needs_input_grad[0]:
             grad_input = grad_output.clone()
-            grad_input[input.ge(1)] = 0.0
-            grad_input[input.le(0)] = 0.0
+            grad_input = grad_input * (input < a).float()
+            grad_input = grad_input * (input > 0).float()
+            # grad_input[input.ge(a)] = 0.0
+            # grad_input[input.le(0)] = 0.0
+        if ctx.needs_input_grad[1]:
+            grad_a = grad_output.clone()
+            grad_a = grad_a * (input > a).float()
+            # grad_a[input.le(a)] = 0
 
-        return grad_input, None
+        return grad_input, grad_a, None, None
 
 
-class DorefaA(nn.Module):
-    def __init__(self):
-        super(DorefaA, self).__init__()
-
-    def forward(self, input, bit):
-        if bit == 1:
-            pass
-        elif bit == 2:
-            pass
-        else:
-            return QActivation.apply(input, bit)
+def AQ(a, bit):
+    if bit == 1:
+        a = ScaleSign.apply(a)
+    elif bit == 2:
+        pass
+    else:
+        # sign = torch.sign(w).float()
+        # scale = torch.max(torch.abs(a))
+        # w = torch.tanh(w)
+        # a = torch.abs(a) / scale
+        # w = w / (2 * scale) + 0.5
+        a = torch.clamp(a, min=0.0, max=1.0)
+        a = Quantize.apply(a, bit, 'fp')
+        # a = a *
+    return a
 
 
 class QConv(nn.Conv2d):
     """docstring for QuanConv"""
 
-    def __init__(self, in_channels, out_channels, kernel_size, nbit_w=4,
-                 nbit_a=4, stride=1,
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1,
                  padding=0, dilation=1, groups=1,
-                 bias=False):
+                 bias=False, nbit_w=4, nbit_a=4):
         super(QConv, self).__init__(
             in_channels, out_channels, kernel_size, stride, padding, dilation,
             groups, bias)
+        # self.a = Parameter(torch.tensor(3.0))  # for PACT
+        # self.scheme = 'linear'
         self.nbit_w = nbit_w
         self.nbit_a = nbit_a
-        self.quan_w = DorefaW()
-        self.quan_a = DorefaA()
+        # self.quan_w = DorefaW()
+        # self.quan_a = AQ(self.scheme, self.nbit_a)
 
     # @weak_script_method
     def forward(self, input):
         if self.nbit_w < 32:
-            w = self.quan_w(self.weight, self.nbit_w)
+            w = DorefaW(self.weight, self.nbit_w)
         else:
             w = self.weight
 
         if self.nbit_a < 32:
-            x = self.quan_a(input, self.nbit_a)
+            x = AQ(input, self.nbit_a)
         else:
             x = input
+
+        # print('weight', w)
+        # print('input', x)
 
         output = F.conv2d(x, w, self.bias, self.stride, self.padding, self.dilation, self.groups)
         return output
@@ -187,28 +248,39 @@ class QConv(nn.Conv2d):
 
 class QLinear(nn.Linear):
     def __init__(self, in_features, out_features, bias=True, nbit_w=4,
-                 nbit_a=4):
+                 nbit_a=32):
         super(QLinear, self).__init__(in_features, out_features, bias)
+
+        # self.a = Parameter(torch.tensor(3.0))  # for PACT
+        # self.scheme = 'linear'
         self.nbit_w = nbit_w
         self.nbit_a = nbit_a
-        self.quan_w = DorefaW()
-        self.quan_a = DorefaA()
+        # self.quan_w = DorefaW()
+        # self.quan_a = AQ(self.scheme, self.nbit_a)
 
     # @weak_script_method
     def forward(self, input):
         if self.nbit_w < 32:
-            w = self.quan_w(self.weight, self.nbit_w)
+            w = DorefaW(self.weight, self.nbit_w)
         else:
             w = self.weight
 
         if self.nbit_a < 32:
-            x = self.quan_a(input, self.nbit_a)
+            x = AQ(input, self.nbit_a)
         else:
             x = input
 
         output = F.linear(x, w, self.bias)
         return output
 
+
+def test():
+    ts = torch.randn(1, 3, 32, 32).cuda()
+    net = QConv(3, 10, 3, stride=1, padding=1).cuda()
+    ot = net(ts)
+
+
+# test()
 
 
 def load_tf_weights_in_bert(model, config, tf_checkpoint_path):
@@ -347,8 +419,8 @@ class BertSelfAttention(nn.Module):
         self.all_head_size = self.num_attention_heads * self.attention_head_size
 
         self.query = QLinear(config.hidden_size, self.all_head_size)
-        self.key = QLinear(config.hidden_size, self.all_head_size)
-        self.value = QLinear(config.hidden_size, self.all_head_size)
+        self.key = nn.Linear(config.hidden_size, self.all_head_size)
+        self.value = nn.Linear(config.hidden_size, self.all_head_size)
 
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
 
@@ -414,7 +486,7 @@ class BertSelfAttention(nn.Module):
 class BertSelfOutput(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.dense = QLinear(config.hidden_size, config.hidden_size)
+        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
         self.LayerNorm = BertLayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
@@ -470,7 +542,7 @@ class BertAttention(nn.Module):
 class BertIntermediate(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.dense = QLinear(config.hidden_size, config.intermediate_size)
+        self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
         if isinstance(config.hidden_act, str):
             self.intermediate_act_fn = ACT2FN[config.hidden_act]
         else:
@@ -485,7 +557,7 @@ class BertIntermediate(nn.Module):
 class BertOutput(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.dense = QLinear(config.intermediate_size, config.hidden_size)
+        self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
         self.LayerNorm = BertLayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
@@ -606,7 +678,7 @@ class BertEncoder(nn.Module):
 class BertPooler(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.dense = QLinear(config.hidden_size, config.hidden_size)
+        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
         self.activation = nn.Tanh()
 
     def forward(self, hidden_states):
@@ -621,7 +693,7 @@ class BertPooler(nn.Module):
 class BertPredictionHeadTransform(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.dense = QLinear(config.hidden_size, config.hidden_size)
+        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
         if isinstance(config.hidden_act, str):
             self.transform_act_fn = ACT2FN[config.hidden_act]
         else:
@@ -642,7 +714,7 @@ class BertLMPredictionHead(nn.Module):
 
         # The output weights are the same as the input embeddings, but there is
         # an output-only bias for each token.
-        self.decoder = QLinear(config.hidden_size, config.vocab_size, bias=False)
+        self.decoder = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         self.bias = nn.Parameter(torch.zeros(config.vocab_size))
 
@@ -668,7 +740,7 @@ class BertOnlyMLMHead(nn.Module):
 class BertOnlyNSPHead(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.seq_relationship = QLinear(config.hidden_size, 2)
+        self.seq_relationship = nn.Linear(config.hidden_size, 2)
 
     def forward(self, pooled_output):
         seq_relationship_score = self.seq_relationship(pooled_output)
@@ -679,7 +751,7 @@ class BertPreTrainingHeads(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.predictions = BertLMPredictionHead(config)
-        self.seq_relationship = QLinear(config.hidden_size, 2)
+        self.seq_relationship = nn.Linear(config.hidden_size, 2)
 
     def forward(self, sequence_output, pooled_output):
         prediction_scores = self.predictions(sequence_output)
@@ -698,14 +770,14 @@ class BertPreTrainedModel(PreTrainedModel):
 
     def _init_weights(self, module):
         """ Initialize the weights """
-        if isinstance(module, (QLinear, nn.Embedding)):
+        if isinstance(module, (nn.Linear, nn.Embedding, QLinear)):
             # Slightly different from the TF version which uses truncated_normal for initialization
             # cf https://github.com/pytorch/pytorch/pull/5617
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
         elif isinstance(module, BertLayerNorm):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
-        if isinstance(module, QLinear) and module.bias is not None:
+        if isinstance(module, nn.Linear) and module.bias is not None:
             module.bias.data.zero_()
 
 
@@ -1360,7 +1432,7 @@ class BertForSequenceClassification(BertPreTrainedModel):
 
         self.bert = BertModel(config)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        self.classifier = QLinear(config.hidden_size, config.num_labels)
+        self.classifier = nn.Linear(config.hidden_size, config.num_labels)
 
         self.init_weights()
 
@@ -1446,7 +1518,7 @@ class BertForMultipleChoice(BertPreTrainedModel):
 
         self.bert = BertModel(config)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        self.classifier = QLinear(config.hidden_size, 1)
+        self.classifier = nn.Linear(config.hidden_size, 1)
 
         self.init_weights()
 
@@ -1541,7 +1613,7 @@ class BertForTokenClassification(BertPreTrainedModel):
 
         self.bert = BertModel(config)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        self.classifier = QLinear(config.hidden_size, config.num_labels)
+        self.classifier = nn.Linear(config.hidden_size, config.num_labels)
 
         self.init_weights()
 
@@ -1628,7 +1700,7 @@ class BertForQuestionAnswering(BertPreTrainedModel):
         self.num_labels = config.num_labels
 
         self.bert = BertModel(config)
-        self.qa_outputs = QLinear(config.hidden_size, config.num_labels)
+        self.qa_outputs = nn.Linear(config.hidden_size, config.num_labels)
 
         self.init_weights()
 

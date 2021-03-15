@@ -437,7 +437,7 @@ class Distiller:
             s_hidden_states = s_hidden_states[-1]  # (bs, seq_length, dim)
             t_hidden_states = t_hidden_states[-1]  # (bs, seq_length, dim)
             mask = attention_mask.unsqueeze(-1).expand_as(s_hidden_states)  # (bs, seq_length, dim)
-            assert s_hidden_states.size() == t_hidden_states.size()
+            #assert s_hidden_states.size() == t_hidden_states.size()
             dim = s_hidden_states.size(-1)
 
             s_hidden_states_slct = torch.masked_select(s_hidden_states, mask)  # (bs * seq_length * dim)

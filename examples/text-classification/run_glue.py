@@ -167,6 +167,8 @@ def main():
         compute_metrics=build_compute_metrics_fn(data_args.task_name),
     )
 
+    #print(model_path=model_args.model_name_or_path if os.path.isdir(model_args.model_name_or_path) else None)
+
     # Training
     if training_args.do_train:
         trainer.train(
@@ -206,6 +208,8 @@ def main():
                         writer.write("%s = %s\n" % (key, value))
 
             eval_results.update(eval_result)
+        #for DAC geng
+        #print('eval_results!!!!!!!!!',eval_results['eval_acc'])
 
     if training_args.do_predict:
         logging.info("*** Test ***")
